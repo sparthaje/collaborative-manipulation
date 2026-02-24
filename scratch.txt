@@ -1,0 +1,63 @@
+sudo lerobot-teleoperate \
+  --robot.type=so101_follower \
+  --robot.port=/dev/cu.usbmodem5AE60550231 \
+  --robot.id=ferb \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/cu.usbmodem5AE60568861 \
+  --teleop.id=ferb_leader \
+  --display_data=true
+
+
+sudo lerobot-teleoperate \
+  --robot.type=so101_follower \
+  --robot.port=/dev/cu.usbmodem5AE60538881 \
+  --robot.id=phineas \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/cu.usbmodem5AE60543551 \
+  --teleop.id=phineas_leader \
+  --display_data=true
+
+
+lerobot-record \
+  --robot.type so101_follower \
+  --robot.port /dev/cu.usbmodem5AE60538881 \
+  --robot.id phineas \
+  --teleop.type so101_leader \
+  --teleop.port /dev/cu.usbmodem5AE60543551 \
+  --teleop.id phineas_leader \
+  --dataset.root data/RowData2Phineas \
+  --dataset.repo_id local/RowData2Phineas \
+  --dataset.push_to_hub False \
+  --dataset.single_task "picker; black screwdriver" \
+  --dataset.num_episodes 50 \
+  --dataset.episode_time_s 45 \
+  --dataset.reset_time_s 30 \
+  --dataset.fps 30 \
+  --robot.cameras '{"wrist": {"type": "opencv", "index_or_path": 0, "width": 1920, "height": 1080, "fps": 30}}'
+
+
+lerobot-record \
+  --robot.type so101_follower \
+  --robot.port /dev/cu.usbmodem5AE60550231 \
+  --robot.id ferb \
+  --teleop.type so101_leader \
+  --teleop.port /dev/cu.usbmodem5AE60568861 \
+  --teleop.id ferb_leader \
+  --dataset.root data/RowData2Ferb \
+  --dataset.repo_id local/RowData2Ferb \
+  --dataset.push_to_hub False \
+  --dataset.single_task "grabber; black screwdriver" \
+  --dataset.num_episodes 50 \
+  --dataset.episode_time_s 45 \
+  --dataset.reset_time_s 30 \
+  --dataset.fps 30 \
+  --robot.cameras '{"wrist": {"type": "opencv", "index_or_path": 1, "width": 1920, "height": 1080, "fps": 30}}'
+
+phineas_f - cu.usbmodem5AE60538881
+phinease_leader - cu.usbmodem5AE60543551
+ferb_follower - cu.usbmodem5AE60550231
+ferb_l - cu.usbmodem5AE60568861
+
+lerobot-setup-motors \
+    --robot.type=so101_follower \
+    --robot.port=/dev/cu.usbmodem5AE60568861

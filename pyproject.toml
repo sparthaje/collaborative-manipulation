@@ -8,6 +8,12 @@ requires-python = ">=3.10,<3.11"
 dependencies = [
   "feetech-servo-sdk>=1.0.0",
   "lerobot @ git+https://github.com/huggingface/lerobot.git",
+  "matplotlib>=3.10.8",
+  "opencv-python>=4.10.0.84",
+  "pandas>=2.2.3",
+  "pyarrow>=17.0.0",
+  "pyqtgraph>=0.13.7",
+  "pyside6>=6.8.1",
 ]
 
 [tool.uv]
