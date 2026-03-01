@@ -1,0 +1,38 @@
+robot:
+  id_left: "phineas"
+  port_left: "/dev/cu.usbmodem5AE60538881"
+  cam_left: 0
+  id_right: "ferb"
+  port_right: "/dev/cu.usbmodem5AE60550231"
+  cam_right: 1
+  cam_top: 2
+
+teleop:
+  id_left: "phineas_leader"
+  port_left: "/dev/cu.usbmodem5AE60543551"
+  id_right: "ferb_leader"
+  port_right: "/dev/cu.usbmodem5AE60568861"
+
+cameras:
+  - wrist_left:
+    - width: 1920
+    - height: 1080
+    - arm: "left"
+    - index: 0
+
+  - wrist_right:
+    - width: 1920
+    - height: 1080
+    - arm: "right"
+    - index: 1
+
+  - top:
+    - width: 1920
+    - height: 1080
+    - arm: "both"
+    - index: 2
+
+# Use degrees instead of radians
+degrees: true
+# Run both joint and camera collection at this rate
+fps: 30

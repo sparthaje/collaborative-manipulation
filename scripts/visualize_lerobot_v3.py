@@ -21,6 +21,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -124,6 +125,8 @@ class Viewer(QMainWindow):
         self.video_streams: list[VideoStream] = []
         self.action_cursor = None
         self.action_lines: list[Any] = []
+        self.videos_visible = True
+        self.playback_speed = 1.0
 
         self.setWindowTitle(f"LeRobot v3 Viewer - {dataset.root}")
         self.resize(1500, 950)
@@ -153,6 +156,23 @@ class Viewer(QMainWindow):
         self.step_btn.clicked.connect(self.step_frame)
         controls.addWidget(self.step_btn)
 
+        controls.addWidget(QLabel("Speed:"))
+        self.speed_group = QButtonGroup(self)
+        self.speed_group.setExclusive(True)
+        self.speed_buttons: dict[float, QPushButton] = {}
+        for speed in (1.0, 2.0, 4.0):
+            btn = QPushButton(f"{int(speed)}x")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked, value=speed: self.set_playback_speed(value))
+            self.speed_group.addButton(btn)
+            self.speed_buttons[speed] = btn
+            controls.addWidget(btn)
+        self.speed_buttons[self.playback_speed].setChecked(True)
+
+        self.video_toggle_btn = QPushButton("Hide Videos")
+        self.video_toggle_btn.clicked.connect(self.toggle_videos_visibility)
+        controls.addWidget(self.video_toggle_btn)
+
         controls.addStretch(1)
         main_layout.addLayout(controls)
 
@@ -178,7 +198,7 @@ class Viewer(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_tick)
-        self.timer.setInterval(int(1000 / max(1.0, self.dataset.dataset_fps)))
+        self._update_timer_interval()
 
         self.load_episode(self.dataset.episode_indices()[0])
 
@@ -204,6 +224,15 @@ class Viewer(QMainWindow):
             panel.setStyleSheet("background-color: black; color: white;")
             self.video_labels.append(panel)
             self.video_grid.addWidget(panel, i * 2 + 1, 0, 1, 2)
+
+        self._apply_video_visibility()
+
+    def _apply_video_visibility(self):
+        for label in self.video_source_labels:
+            label.setVisible(self.videos_visible)
+        for panel in self.video_labels:
+            panel.setVisible(self.videos_visible)
+        self.video_toggle_btn.setText("Hide Videos" if self.videos_visible else "Show Videos")
 
     def _clear_video_streams(self):
         for stream in self.video_streams:
@@ -287,21 +316,36 @@ class Viewer(QMainWindow):
         self.play_btn.setText("Play")
         self.timer.stop()
 
+    def toggle_videos_visibility(self):
+        self.videos_visible = not self.videos_visible
+        self._apply_video_visibility()
+
+    def set_playback_speed(self, speed: float):
+        self.playback_speed = speed
+        self._update_timer_interval()
+        button = self.speed_buttons.get(speed)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+    def _update_timer_interval(self):
+        interval_ms = int(1000 / max(1.0, self.dataset.dataset_fps))
+        self.timer.setInterval(max(1, interval_ms))
+
     def on_tick(self):
-        if not self.step_frame():
+        if not self.step_frame(step=int(self.playback_speed)):
             self.pause()
 
-    def step_frame(self) -> bool:
+    def step_frame(self, step: int = 1) -> bool:
         if self.episode_df is None:
             return False
         if self.current_frame >= len(self.episode_df) - 1:
             return False
-        self.current_frame += 1
+        self.current_frame = min(self.current_frame + max(1, step), len(self.episode_df) - 1)
         self.slider.blockSignals(True)
         self.slider.setValue(self.current_frame)
         self.slider.blockSignals(False)
         self.render_frame(self.current_frame)
-        return True
+        return self.current_frame < len(self.episode_df) - 1
 
     def on_slider_changed(self, value: int):
         self.current_frame = value

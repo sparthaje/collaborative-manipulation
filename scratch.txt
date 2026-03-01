@@ -33,7 +33,7 @@ lerobot-record \
   --dataset.episode_time_s 45 \
   --dataset.reset_time_s 30 \
   --dataset.fps 30 \
-  --robot.cameras '{"wrist": {"type": "opencv", "index_or_path": 0, "width": 1920, "height": 1080, "fps": 30}}'
+  --robot.cameras '{"wrist": {"type": "opencv", "index_or_path": 0, "width": 1920, "height": 1080, "fps": 30}, "top": {"type": "opencv", "index_or_path": 2, "width": 1920, "height": 1080, "fps": 30}}'
 
 
 lerobot-record \
@@ -61,3 +61,14 @@ ferb_l - cu.usbmodem5AE60568861
 lerobot-setup-motors \
     --robot.type=so101_follower \
     --robot.port=/dev/cu.usbmodem5AE60568861
+
+
+lerobot-calibrate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/cu.usbmodem5AE60538881 \
+    --robot.id=phineas
+
+lerobot-calibrate \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/cu.usbmodem5AE60543551 \
+    --teleop.id=phineas_leader
