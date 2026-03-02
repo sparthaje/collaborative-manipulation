@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.11"
 
 dependencies = [
+  "bitsandbytes>=0.49.2",
   "feetech-servo-sdk>=1.0.0",
   "lerobot @ git+https://github.com/huggingface/lerobot.git",
   "matplotlib>=3.10.8",
@@ -14,6 +15,8 @@ dependencies = [
   "pyarrow>=17.0.0",
   "pyqtgraph>=0.13.7",
   "pyside6>=6.8.1",
+  "transformers>=4.57.6",
+  "trl[peft]>=0.29.0",
 ]
 
 [tool.uv]
