@@ -1,22 +1,21 @@
-"""Siamese VLA Dataset for bimanual robot fine-tuning.
+"""Unified Bimanual VLA Dataset for fine-tuning.
 
 Each item yields a TRL-compatible chat message list with:
-  - System prompt (arm identity)
-  - User message (wrist camera image + action history as tokens)
-  - Assistant message (chain-of-thought + 48 action tokens)
+  - System prompt (unified, controls both arms)
+  - User message (3 camera images + 12-joint action history as tokens)
+  - Assistant message (chain-of-thought + 96 action tokens)
 
-Every valid timestep produces 2 samples (left + right arm POV).
+Each valid timestep produces 1 sample (both arms together).
 
 Usage:
-    from scripts.dataloader import SiameseVLADataset
-    dataset = SiameseVLADataset("data/grabber_picker_black_marker_20260228_150311")
+    from scripts.dataloader import BimanualVLADataset
+    dataset = BimanualVLADataset("data/grabber_picker_black_marker_20260226_211245")
     sample = dataset[0]  # returns list of chat message dicts
 """
 
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import numpy as np
@@ -33,21 +32,24 @@ DATASET_FPS = 30
 TARGET_FPS = 4
 ACTION_HISTORY_LEN = 4  # 1 second at 4 FPS
 ACTION_CHUNK_LEN = 8  # 2 seconds at 4 FPS
+NUM_JOINTS_PER_ARM = 6
+NUM_JOINTS_TOTAL = 12
 
 VIDEO_KEYS = {
-    "left": "observation.images.left.wrist_left",
-    "right": "observation.images.right.wrist_right",
+    "left_wrist": "observation.images.left.wrist_left",
+    "right_wrist": "observation.images.right.wrist_right",
+    "overhead": "observation.images.left.top",
 }
 
 
-class SiameseVLADataset(Dataset):
-    """Siamese VLA dataset that yields chat-format training samples.
+class BimanualVLADataset(Dataset):
+    """Unified bimanual VLA dataset that yields chat-format training samples.
 
-    Each item is one (arm_pov, prompt, action_tokens) tuple formatted as
-    TRL-compatible chat messages.
+    Each item contains 3 camera images, 12-joint action history, and 96
+    action tokens (8 timesteps x 12 joints) as the training target.
 
     For E episodes, each with F_i valid frames at 4 FPS:
-        Total samples = 2 * sum(F_i for i in episodes)
+        Total samples = sum(F_i for i in episodes)
         where F_i = num_frames_4fps_i - ACTION_CHUNK_LEN
     """
 
@@ -83,8 +85,8 @@ class SiameseVLADataset(Dataset):
             with open(aug_path) as f:
                 self.augmentations[ep_idx] = json.load(f)
 
-        # Build index table: list of (episode_idx, 4fps_frame_idx, arm)
-        self._index_table: list[tuple[int, int, str]] = []
+        # Build index table: list of (episode_idx, 4fps_frame_idx)
+        self._index_table: list[tuple[int, int]] = []
         self._episode_data: dict[int, dict] = {}
 
         for _, row in self.episodes_df.iterrows():
@@ -102,94 +104,100 @@ class SiameseVLADataset(Dataset):
             # Pre-extract actions as numpy array for fast access
             actions = np.stack(ep_data["action"].values)  # (ep_length, 12)
 
-            # Store episode info
+            # Store video metadata for all 3 cameras
+            video_info = {}
+            for cam_name, video_key in VIDEO_KEYS.items():
+                chunk_idx = int(row[f"videos/{video_key}/chunk_index"])
+                file_idx = int(row[f"videos/{video_key}/file_index"])
+                video_info[cam_name] = {
+                    "path": (
+                        self.dataset_root
+                        / "videos"
+                        / video_key
+                        / f"chunk-{chunk_idx:03d}"
+                        / f"file-{file_idx:03d}.mp4"
+                    ),
+                    "from_ts": float(row[f"videos/{video_key}/from_timestamp"]),
+                }
+
             self._episode_data[ep_idx] = {
                 "actions": actions,
                 "length": ep_length,
                 "frame_indices_4fps": frame_indices_4fps,
                 "num_frames_4fps": num_frames_4fps,
-                # Video metadata
-                "left_video_path": self._get_video_path(row, VIDEO_KEYS["left"]),
-                "left_from_ts": float(
-                    row[f"videos/{VIDEO_KEYS['left']}/from_timestamp"]
-                ),
-                "right_video_path": self._get_video_path(row, VIDEO_KEYS["right"]),
-                "right_from_ts": float(
-                    row[f"videos/{VIDEO_KEYS['right']}/from_timestamp"]
-                ),
+                "video_info": video_info,
             }
 
             # Valid frame range: need ACTION_CHUNK_LEN future steps
             num_valid = num_frames_4fps - ACTION_CHUNK_LEN
             for t in range(num_valid):
-                self._index_table.append((ep_idx, t, "left"))
-                self._index_table.append((ep_idx, t, "right"))
-
-    def _get_video_path(self, episode_row: pd.Series, video_key: str) -> Path:
-        """Construct video file path from episode metadata."""
-        chunk_idx = int(episode_row[f"videos/{video_key}/chunk_index"])
-        file_idx = int(episode_row[f"videos/{video_key}/file_index"])
-        return (
-            self.dataset_root
-            / "videos"
-            / video_key
-            / f"chunk-{chunk_idx:03d}"
-            / f"file-{file_idx:03d}.mp4"
-        )
+                self._index_table.append((ep_idx, t))
 
     def __len__(self) -> int:
         return len(self._index_table)
 
     def _load_frame(
-        self, ep_idx: int, frame_30fps: int, arm: str
+        self, ep_idx: int, frame_30fps: int, cam_name: str
     ) -> torch.Tensor:
-        """Load a single video frame.
+        """Load a single video frame from a specific camera.
 
         Returns:
             Tensor of shape (C, H, W) in [0, 1].
         """
         ep_data = self._episode_data[ep_idx]
-        video_key = "left" if arm == "left" else "right"
-        video_path = ep_data[f"{video_key}_video_path"]
-        from_ts = ep_data[f"{video_key}_from_ts"]
+        vi = ep_data["video_info"][cam_name]
 
         # Compute absolute timestamp within the MP4
         frame_ts = frame_30fps / DATASET_FPS
-        absolute_ts = from_ts + frame_ts
+        absolute_ts = vi["from_ts"] + frame_ts
 
         frames = decode_video_frames(
-            video_path,
+            vi["path"],
             [absolute_ts],
             self.tolerance_s,
             self.video_backend,
         )
-        # decode_video_frames returns (N, C, H, W) or (N, H, W, C) depending on backend
         frame = frames.squeeze(0)  # Remove batch dim
         # Ensure CHW format
         if frame.ndim == 3 and frame.shape[-1] == 3:
             frame = frame.permute(2, 0, 1)
         return frame
 
-    def _get_arm_actions(
-        self, ep_idx: int, frame_30fps_indices: list[int], arm: str
-    ) -> np.ndarray:
-        """Get action values for a specific arm at given 30fps frame indices.
+    def _encode_12joint_action(self, action_12d: np.ndarray) -> list[int]:
+        """Encode a 12-dim action (both arms) to 12 token IDs.
+
+        Encodes left arm (indices 0:6) then right arm (indices 6:12)
+        using the same ActionTokenizer for both.
+        """
+        left_tokens = self.action_tokenizer.encode_action(action_12d[:NUM_JOINTS_PER_ARM])
+        right_tokens = self.action_tokenizer.encode_action(action_12d[NUM_JOINTS_PER_ARM:])
+        return left_tokens + right_tokens
+
+    def _format_action_history(
+        self, actions_12d: np.ndarray
+    ) -> str:
+        """Format action history as text with token names.
+
+        Args:
+            actions_12d: (ACTION_HISTORY_LEN, 12) array of joint values.
 
         Returns:
-            (T, 6) array of joint values.
+            Formatted string with left | right token separation per timestep.
         """
-        ep_data = self._episode_data[ep_idx]
-        actions = ep_data["actions"]  # (ep_length, 12)
-        arm_slice = slice(0, 6) if arm == "left" else slice(6, 12)
-        return actions[frame_30fps_indices, arm_slice]
-
-    def _format_action_history(self, action_tokens_per_step: list[list[int]]) -> str:
-        """Format action history as text with token names."""
         lines = []
-        for i, tokens in enumerate(action_tokens_per_step):
+        for i in range(ACTION_HISTORY_LEN):
             label = f"t-{ACTION_HISTORY_LEN - i}"
-            token_names = self.action_tokenizer.token_ids_to_names(tokens)
-            lines.append(f"{label}: {' '.join(token_names)}")
+            left_tokens = self.action_tokenizer.encode_action(
+                actions_12d[i, :NUM_JOINTS_PER_ARM]
+            )
+            right_tokens = self.action_tokenizer.encode_action(
+                actions_12d[i, NUM_JOINTS_PER_ARM:]
+            )
+            left_names = self.action_tokenizer.token_ids_to_names(left_tokens)
+            right_names = self.action_tokenizer.token_ids_to_names(right_tokens)
+            lines.append(
+                f"{label}: {' '.join(left_names)} | {' '.join(right_names)}"
+            )
         return "\n".join(lines)
 
     def __getitem__(self, idx: int) -> list[dict]:
@@ -198,49 +206,51 @@ class SiameseVLADataset(Dataset):
         Returns:
             List of message dicts with 'role' and 'content' keys.
         """
-        ep_idx, t_4fps, arm = self._index_table[idx]
+        ep_idx, t_4fps = self._index_table[idx]
         ep_data = self._episode_data[ep_idx]
         aug = self.augmentations[ep_idx]
         frame_indices_4fps = ep_data["frame_indices_4fps"]
 
-        # 1. Current image
+        # 1. Current images (all 3 cameras)
         current_30fps = frame_indices_4fps[t_4fps]
-        current_image = self._load_frame(ep_idx, current_30fps, arm)
+        left_wrist_img = self._load_frame(ep_idx, current_30fps, "left_wrist")
+        right_wrist_img = self._load_frame(ep_idx, current_30fps, "right_wrist")
+        overhead_img = self._load_frame(ep_idx, current_30fps, "overhead")
 
-        # 2. Action history (last 4 steps at 4 FPS)
+        # 2. Action history (last 4 steps at 4 FPS, all 12 joints)
         history_4fps_indices = [
             max(0, t_4fps - ACTION_HISTORY_LEN + i) for i in range(ACTION_HISTORY_LEN)
         ]
         history_30fps = [frame_indices_4fps[i] for i in history_4fps_indices]
-        history_actions = self._get_arm_actions(ep_idx, history_30fps, arm)
-        history_tokens_per_step = [
-            self.action_tokenizer.encode_action(history_actions[i])
-            for i in range(ACTION_HISTORY_LEN)
-        ]
-        action_history_text = self._format_action_history(history_tokens_per_step)
+        actions = ep_data["actions"]  # (ep_length, 12)
+        history_actions = actions[history_30fps]  # (4, 12)
+        action_history_text = self._format_action_history(history_actions)
 
         # 3. Prompts from augmentation
-        arm_key = f"{arm}_arm"
-        system_prompt = aug[arm_key]["system_prompt"]
-        user_prompt = aug[arm_key]["user_prompt_template"].format(
+        system_prompt = aug["system_prompt"]
+        user_prompt = aug["user_prompt_template"].format(
             task_description=aug["task_description"],
             action_history=action_history_text,
         )
-        cot = aug[arm_key]["chain_of_thought_template"]
+        cot = aug["chain_of_thought_template"]
 
-        # 4. Action chunk (8 future timesteps at 4 FPS)
+        # 4. Action chunk (8 future timesteps at 4 FPS, all 12 joints)
         chunk_4fps_indices = list(range(t_4fps, t_4fps + ACTION_CHUNK_LEN))
         chunk_30fps = [frame_indices_4fps[i] for i in chunk_4fps_indices]
-        chunk_actions = self._get_arm_actions(ep_idx, chunk_30fps, arm)
-        chunk_token_ids = self.action_tokenizer.encode_action_chunk(chunk_actions)
+        chunk_actions = actions[chunk_30fps]  # (8, 12)
+
+        # Encode all 8 timesteps x 12 joints = 96 tokens
+        chunk_token_ids = []
+        for t in range(ACTION_CHUNK_LEN):
+            chunk_token_ids.extend(self._encode_12joint_action(chunk_actions[t]))
         chunk_token_names = self.action_tokenizer.token_ids_to_names(chunk_token_ids)
 
         # 5. Format assistant response: CoT + action tokens
-        # Group tokens by timestep for readability (8 groups of 6)
+        # Group tokens by timestep (8 groups of 12) for the output
         action_text_parts = []
         for t in range(ACTION_CHUNK_LEN):
-            start = t * self.action_tokenizer.NUM_JOINTS
-            end = start + self.action_tokenizer.NUM_JOINTS
+            start = t * NUM_JOINTS_TOTAL
+            end = start + NUM_JOINTS_TOTAL
             action_text_parts.append(" ".join(chunk_token_names[start:end]))
         action_text = " ".join(action_text_parts)
         assistant_text = f"{cot}{action_text}"
@@ -254,7 +264,9 @@ class SiameseVLADataset(Dataset):
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": current_image},
+                    {"type": "image", "image": left_wrist_img},
+                    {"type": "image", "image": right_wrist_img},
+                    {"type": "image", "image": overhead_img},
                     {"type": "text", "text": user_prompt},
                 ],
             },
@@ -268,17 +280,19 @@ class SiameseVLADataset(Dataset):
 
 
 def validate_dataset(dataset_root: str | Path) -> None:
-    """Validate the SiameseVLADataset."""
+    """Validate the BimanualVLADataset."""
+    import re
+
     dataset_root = Path(dataset_root)
     print("Loading dataset...")
-    ds = SiameseVLADataset(dataset_root)
+    ds = BimanualVLADataset(dataset_root)
 
-    # Check total size = 2 * sum(valid_frames per episode)
+    # Check total size = sum(valid_frames per episode)
     total_valid = 0
     for ep_idx, ep_data in ds._episode_data.items():
         num_valid = ep_data["num_frames_4fps"] - ACTION_CHUNK_LEN
         total_valid += num_valid
-    expected_len = 2 * total_valid
+    expected_len = total_valid
     actual_len = len(ds)
     print(f"Dataset length: {actual_len} (expected: {expected_len})")
     assert actual_len == expected_len, f"Length mismatch: {actual_len} != {expected_len}"
@@ -289,7 +303,7 @@ def validate_dataset(dataset_root: str | Path) -> None:
     test_indices = [0, 1, len(ds) // 4, len(ds) // 2, len(ds) - 1]
     for i in test_indices:
         sample = ds[i]
-        ep_idx, t_4fps, arm = ds._index_table[i]
+        ep_idx, t_4fps = ds._index_table[i]
 
         # Check message structure
         assert len(sample) == 3, f"Expected 3 messages, got {len(sample)}"
@@ -297,29 +311,54 @@ def validate_dataset(dataset_root: str | Path) -> None:
         assert sample[1]["role"] == "user"
         assert sample[2]["role"] == "assistant"
 
-        # Check image in user message
+        # Check 3 images in user message
         user_content = sample[1]["content"]
         assert user_content[0]["type"] == "image"
-        image = user_content[0]["image"]
-        assert isinstance(image, torch.Tensor)
-        assert image.ndim == 3, f"Expected 3D tensor, got {image.ndim}D"
-        assert image.shape[0] == 3, f"Expected CHW format, got shape {image.shape}"
-        assert image.min() >= 0 and image.max() <= 1, "Image values out of [0,1] range"
+        assert user_content[1]["type"] == "image"
+        assert user_content[2]["type"] == "image"
+        assert user_content[3]["type"] == "text"
 
-        # Check assistant response has action tokens
+        for img_idx in range(3):
+            image = user_content[img_idx]["image"]
+            assert isinstance(image, torch.Tensor)
+            assert image.ndim == 3, f"Expected 3D tensor, got {image.ndim}D"
+            assert image.shape[0] == 3, f"Expected CHW format, got shape {image.shape}"
+            assert image.min() >= 0 and image.max() <= 1, (
+                "Image values out of [0,1] range"
+            )
+
+        # Check assistant response has 96 action tokens
         assistant_text = sample[2]["content"][0]["text"]
         assert "<think>" in assistant_text
         assert "</think>" in assistant_text
-        # Count action tokens
-        import re
         action_tokens = re.findall(r"<action_j\d+_b\d+>", assistant_text)
-        assert len(action_tokens) == 48, (
-            f"Expected 48 action tokens, got {len(action_tokens)}"
+        assert len(action_tokens) == 96, (
+            f"Expected 96 action tokens, got {len(action_tokens)}"
         )
 
+        # Verify token structure: 8 timesteps of 12 tokens each
+        # Each timestep should have j0-j5 (left) then j0-j5 (right)
+        for t in range(ACTION_CHUNK_LEN):
+            timestep_tokens = action_tokens[
+                t * NUM_JOINTS_TOTAL : (t + 1) * NUM_JOINTS_TOTAL
+            ]
+            for j in range(NUM_JOINTS_PER_ARM):
+                assert f"_j{j}_" in timestep_tokens[j], (
+                    f"Timestep {t}, left joint {j}: unexpected token {timestep_tokens[j]}"
+                )
+                assert f"_j{j}_" in timestep_tokens[NUM_JOINTS_PER_ARM + j], (
+                    f"Timestep {t}, right joint {j}: unexpected token "
+                    f"{timestep_tokens[NUM_JOINTS_PER_ARM + j]}"
+                )
+
+        cam_names = ["left_wrist", "right_wrist", "overhead"]
+        img_shapes = [
+            user_content[k]["image"].shape for k in range(3)
+        ]
         print(
-            f"  Sample {i}: ep={ep_idx}, t={t_4fps}, arm={arm}, "
-            f"image={image.shape}, tokens={len(action_tokens)}"
+            f"  Sample {i}: ep={ep_idx}, t={t_4fps}, "
+            f"images={[f'{cam_names[k]}:{s}' for k, s in enumerate(img_shapes)]}, "
+            f"tokens={len(action_tokens)}"
         )
 
     print("\nAll validation checks PASSED")
@@ -331,6 +370,6 @@ if __name__ == "__main__":
     dataset_root = Path(
         sys.argv[1]
         if len(sys.argv) > 1
-        else "data/grabber_picker_black_marker_20260228_150311"
+        else "data/grabber_picker_black_marker_20260226_211245"
     )
     validate_dataset(dataset_root)

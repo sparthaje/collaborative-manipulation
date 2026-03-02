@@ -1,4 +1,4 @@
-"""Episode augmentation script for Siamese VLA fine-tuning.
+"""Episode augmentation script for unified bimanual VLA fine-tuning.
 
 Reads episode metadata and generates per-episode JSON files containing
 prompt templates and 4 FPS frame indices for training.
@@ -19,30 +19,19 @@ import pandas as pd
 DATASET_FPS = 30
 TARGET_FPS = 4
 
-SYSTEM_PROMPT_LEFT = (
-    "You are controlling the LEFT arm of a two-arm robot system. "
-    "You receive your wrist camera image and your recent action history. "
-    "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 action tokens."
+SYSTEM_PROMPT = (
+    "You control both arms of a bimanual robot system. "
+    "You receive three camera views (left wrist, right wrist, overhead) "
+    "and recent joint history for all 12 joints (6 per arm). "
+    "Output the next 8 timesteps of joint commands for both arms as 96 action tokens."
 )
 
-SYSTEM_PROMPT_RIGHT = (
-    "You are controlling the RIGHT arm of a two-arm robot system. "
-    "You receive your wrist camera image and your recent action history. "
-    "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 action tokens."
-)
-
-USER_PROMPT_TEMPLATE_LEFT = (
-    "You are the LEFT arm. The task is: {task_description}. "
-    "Here is your current wrist camera image and your last 4 actions:\n"
+USER_PROMPT_TEMPLATE = (
+    "Task: {task_description}.\n"
+    "Here are your three camera views and recent joint history "
+    "(12 joints per step: left arm then right arm):\n"
     "{action_history}\n"
-    "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 tokens."
-)
-
-USER_PROMPT_TEMPLATE_RIGHT = (
-    "You are the RIGHT arm. The task is: {task_description}. "
-    "Here is your current wrist camera image and your last 4 actions:\n"
-    "{action_history}\n"
-    "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 tokens."
+    "Output the next 8 timesteps of joint commands (96 tokens: 8 steps x 12 joints)."
 )
 
 COT_TEMPLATE = "<think>\n</think>"
@@ -57,7 +46,6 @@ def compute_4fps_indices(num_frames_30fps: int) -> list[int]:
     indices = []
     for i in range(num_frames_4fps):
         frame_30fps = round(i * DATASET_FPS / TARGET_FPS)
-        # Clamp to valid range
         frame_30fps = min(frame_30fps, num_frames_30fps - 1)
         indices.append(frame_30fps)
     return indices
@@ -87,7 +75,7 @@ def generate_augmentation(dataset_root: str | Path) -> list[dict]:
     """
     dataset_root = Path(dataset_root)
 
-    # Load task name (task name is the DataFrame index, not a column)
+    # Load task name
     tasks_df = pd.read_parquet(dataset_root / "meta" / "tasks.parquet")
     task_name = str(tasks_df.index[0])
     task_description = parse_task_description(task_name)
@@ -114,16 +102,9 @@ def generate_augmentation(dataset_root: str | Path) -> list[dict]:
             "task_description": task_description,
             "num_frames_30fps": num_frames,
             "num_frames_4fps": num_frames_4fps,
-            "left_arm": {
-                "system_prompt": SYSTEM_PROMPT_LEFT,
-                "user_prompt_template": USER_PROMPT_TEMPLATE_LEFT,
-                "chain_of_thought_template": COT_TEMPLATE,
-            },
-            "right_arm": {
-                "system_prompt": SYSTEM_PROMPT_RIGHT,
-                "user_prompt_template": USER_PROMPT_TEMPLATE_RIGHT,
-                "chain_of_thought_template": COT_TEMPLATE,
-            },
+            "system_prompt": SYSTEM_PROMPT,
+            "user_prompt_template": USER_PROMPT_TEMPLATE,
+            "chain_of_thought_template": COT_TEMPLATE,
             "frame_indices_4fps": frame_indices_4fps,
         }
 
@@ -178,13 +159,14 @@ def validate_augmentation(dataset_root: str | Path) -> None:
                 f"Episode {ep_idx}: frame index {idx} out of bounds"
             )
 
-        # Check required keys
-        for arm in ["left_arm", "right_arm"]:
-            assert "system_prompt" in aug[arm]
-            assert "user_prompt_template" in aug[arm]
-            assert "chain_of_thought_template" in aug[arm]
-            assert "{action_history}" in aug[arm]["user_prompt_template"]
-            assert "{task_description}" in aug[arm]["user_prompt_template"]
+        # Check unified prompt keys (no arm-specific keys)
+        assert "system_prompt" in aug
+        assert "user_prompt_template" in aug
+        assert "chain_of_thought_template" in aug
+        assert "{action_history}" in aug["user_prompt_template"]
+        assert "{task_description}" in aug["user_prompt_template"]
+        assert "left_arm" not in aug, "Found old arm-specific key 'left_arm'"
+        assert "right_arm" not in aug, "Found old arm-specific key 'right_arm'"
 
     print(f"Validated {len(json_files)} augmentation files - all OK")
 
@@ -195,7 +177,7 @@ if __name__ == "__main__":
     dataset_root = Path(
         sys.argv[1]
         if len(sys.argv) > 1
-        else "data/grabber_picker_black_marker_20260228_150311"
+        else "data/grabber_picker_black_marker_20260226_211245"
     )
 
     print(f"Generating augmentation for: {dataset_root}")
@@ -203,8 +185,10 @@ if __name__ == "__main__":
     print(f"Generated {len(results)} episode augmentation files")
 
     for r in results[:3]:
-        print(f"  Episode {r['episode_index']}: {r['num_frames_30fps']} frames @ 30fps "
-              f"-> {r['num_frames_4fps']} frames @ 4fps")
+        print(
+            f"  Episode {r['episode_index']}: {r['num_frames_30fps']} frames @ 30fps "
+            f"-> {r['num_frames_4fps']} frames @ 4fps"
+        )
 
     print()
     print("=== Validation ===")
