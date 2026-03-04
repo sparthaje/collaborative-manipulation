@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -29,20 +30,29 @@ SYSTEM_PROMPT_RIGHT = (
 )
 
 USER_PROMPT_TEMPLATE_LEFT = (
-    "You are the LEFT arm. The task is: {task_description}. "
+    "You are the LEFT arm. {task_description}. "
     "Here is your current wrist camera image and your last 4 actions:\n"
     "{action_history}\n"
     "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 tokens."
 )
 
 USER_PROMPT_TEMPLATE_RIGHT = (
-    "You are the RIGHT arm. The task is: {task_description}. "
+    "You are the RIGHT arm. {task_description}. "
     "Here is your current wrist camera image and your last 4 actions:\n"
     "{action_history}\n"
     "Output the next 8 joint actions (2 seconds at 4 FPS) as 48 tokens."
 )
 
-COT_TEMPLATE = "<think>\n</think>"
+PICKER_STAGES = ["picking", "reaching", "releasing", "disengaging", "watching"]
+GRASPER_STAGES = ["watching", "reaching", "holding", "disengaging", "dropping"]
+ALL_STAGE_NAMES = set(PICKER_STAGES) | set(GRASPER_STAGES)
+
+VELOCITY_THRESHOLD = 5.0  # deg/s — from DATA.md
+GRIPPER_THRESHOLD = 7.0  # degrees — from DATA.md
+GRIPPER_STABILITY_FRAMES = 60  # 2 seconds at 30 FPS
+VELOCITY_WINDOW = 15  # half second at 30 FPS
+WATCHING_SETTLE_FRAMES = 30  # ~1 second at 30 FPS
+MIN_INTERMEDIATE_FRAMES = 4  # minimum 4fps frames of holding/releasing
 
 
 def load_ignore_list(dataset_root: str | Path) -> set[int]:
@@ -74,17 +84,212 @@ def compute_4fps_indices(num_frames_30fps: int) -> list[int]:
     return indices
 
 
-def parse_task_description(task_name: str) -> str:
-    """Parse semicolon-separated task name into readable description.
+def compute_arm_velocity(positions_30fps: np.ndarray) -> np.ndarray:
+    """Compute smoothed L2 velocity for joints 0–4 (excluding gripper) at each frame.
 
-    'grabber;picker;black_marker' -> 'Hand off the black marker (grabber to picker)'
+    Args:
+        positions_30fps: (N, 6) array — 6 joints for one arm at 30 FPS.
+
+    Returns:
+        (N,) array of smoothed L2 velocity in deg/s.
+    """
+    # Frame-to-frame velocity on joints 0-4 only
+    vel = np.diff(positions_30fps[:, :5], axis=0) * DATASET_FPS  # (N-1, 5) deg/s
+    # Pad first frame by repeating
+    vel = np.vstack([vel[:1], vel])  # (N, 5)
+    # L2 norm across joints
+    l2 = np.linalg.norm(vel, axis=1)  # (N,)
+    # Centered rolling average
+    kernel = np.ones(VELOCITY_WINDOW) / VELOCITY_WINDOW
+    return np.convolve(l2, kernel, mode="same")
+
+
+def gripper_is_stable(
+    gripper_values: np.ndarray, frame_idx: int, target_state: str
+) -> bool:
+    """Check if gripper stays in target state for GRIPPER_STABILITY_FRAMES.
+
+    Args:
+        gripper_values: (N,) array of gripper angles in degrees.
+        frame_idx: current 30 FPS frame index.
+        target_state: 'open' or 'closed'.
+
+    Returns:
+        True if all frames in the look-ahead window satisfy the condition.
+    """
+    end = min(frame_idx + GRIPPER_STABILITY_FRAMES, len(gripper_values))
+    segment = gripper_values[frame_idx:end]
+    if len(segment) == 0:
+        return False
+    if target_state == "closed":
+        return bool(np.all(segment <= GRIPPER_THRESHOLD))
+    return bool(np.all(segment > GRIPPER_THRESHOLD))
+
+
+def classify_stages_joint(
+    picker_actions_30fps: np.ndarray,
+    grabber_actions_30fps: np.ndarray,
+) -> tuple[list[str], list[str]]:
+    """Classify per-frame stage labels for both arms using a joint state machine.
+
+    Both arms are processed simultaneously so that if one arm reaches
+    disengaging, the other arm is forced to disengaging on the next frame.
+
+    Args:
+        picker_actions_30fps: (N, 6) array for the picker arm at 30 FPS.
+        grabber_actions_30fps: (N, 6) array for the grabber arm at 30 FPS.
+
+    Returns:
+        (picker_stages, grabber_stages): Lists of N stage label strings each.
+    """
+    N = len(picker_actions_30fps)
+
+    p_velocity = compute_arm_velocity(picker_actions_30fps)
+    p_gripper = picker_actions_30fps[:, 5]
+    g_velocity = compute_arm_velocity(grabber_actions_30fps)
+    g_gripper = grabber_actions_30fps[:, 5]
+
+    p_stage = 0  # index into PICKER_STAGES
+    g_stage = 0  # index into GRASPER_STAGES
+    picker_seen_open = False
+    grabber_seen_open = False
+    holding_was_still = False
+
+    picker_result: list[str] = []
+    grabber_result: list[str] = []
+
+    for i in range(N):
+        # --- Failsafe: if one arm is disengaging (>=3), force the other forward ---
+        if p_stage >= 3 and g_stage < 3:
+            g_stage = 3
+        elif g_stage >= 3 and p_stage < 3:
+            p_stage = 3
+
+        # --- Picker state machine ---
+        if p_stage == 0:  # picking → reaching
+            if p_gripper[i] > GRIPPER_THRESHOLD:
+                picker_seen_open = True
+            if picker_seen_open and p_gripper[i] <= GRIPPER_THRESHOLD and gripper_is_stable(
+                p_gripper, i, "closed"
+            ):
+                p_stage = 1
+        elif p_stage == 1:  # reaching → releasing
+            if p_gripper[i] > GRIPPER_THRESHOLD and gripper_is_stable(
+                p_gripper, i, "open"
+            ):
+                p_stage = 2
+        elif p_stage == 2:  # releasing → disengaging
+            if p_velocity[i] > VELOCITY_THRESHOLD:
+                p_stage = 3
+        elif p_stage == 3:  # disengaging → watching
+            if p_velocity[i] < VELOCITY_THRESHOLD:
+                remaining = p_velocity[i:]
+                check = min(WATCHING_SETTLE_FRAMES, len(remaining))
+                if np.all(remaining[:check] < VELOCITY_THRESHOLD):
+                    p_stage = 4
+
+        # --- Grabber state machine ---
+        if g_stage == 0:  # watching → reaching
+            picker_advanced = p_stage >= 1
+            if picker_advanced and g_velocity[i] > VELOCITY_THRESHOLD:
+                g_stage = 1
+        elif g_stage == 1:  # reaching → holding
+            if g_gripper[i] > GRIPPER_THRESHOLD:
+                grabber_seen_open = True
+            if grabber_seen_open and g_gripper[i] <= GRIPPER_THRESHOLD and gripper_is_stable(
+                g_gripper, i, "closed"
+            ):
+                g_stage = 2
+                holding_was_still = False
+        elif g_stage == 2:  # holding → disengaging
+            if g_velocity[i] < VELOCITY_THRESHOLD:
+                holding_was_still = True
+            elif holding_was_still and g_velocity[i] > VELOCITY_THRESHOLD:
+                g_stage = 3
+        elif g_stage == 3:  # disengaging → dropping
+            if g_gripper[i] > GRIPPER_THRESHOLD and gripper_is_stable(
+                g_gripper, i, "open"
+            ):
+                g_stage = 4
+
+        picker_result.append(PICKER_STAGES[p_stage])
+        grabber_result.append(GRASPER_STAGES[g_stage])
+
+    return picker_result, grabber_result
+
+
+def ensure_min_intermediate_frames(
+    stages_4fps: list[str],
+    intermediate_label: str,
+    min_frames: int = MIN_INTERMEDIATE_FRAMES,
+) -> list[str]:
+    """Ensure at least *min_frames* of the intermediate stage between reaching and disengaging.
+
+    At 4 FPS the holding/releasing stage can be very short or absent entirely.
+    This backfills preceding "reaching" frames with *intermediate_label* so
+    there are at least *min_frames* of that stage in the 4 FPS sequence.
+    """
+    result = list(stages_4fps)
+
+    count = result.count(intermediate_label)
+    if count >= min_frames:
+        return result
+
+    # Find the first frame that is either the intermediate or disengaging
+    # — this marks the transition boundary after reaching.
+    first_transition = None
+    for i, s in enumerate(result):
+        if s == intermediate_label or s == "disengaging":
+            first_transition = i
+            break
+
+    if first_transition is None:
+        return result  # arm never progressed past reaching
+
+    needed = min_frames - count
+    for i in range(first_transition - 1, -1, -1):
+        if needed <= 0:
+            break
+        if result[i] == "reaching":
+            result[i] = intermediate_label
+            needed -= 1
+
+    return result
+
+
+def build_per_frame_cot(
+    stages_30fps: list[str], frame_indices_4fps: list[int]
+) -> list[str]:
+    """Sample 30 FPS stage labels at 4 FPS indices and wrap as CoT strings."""
+    return [f"<think>{stages_30fps[idx]}</think>" for idx in frame_indices_4fps]
+
+
+def parse_task_description(task_name: str) -> tuple[str, str]:
+    """Parse semicolon-separated task name into per-arm descriptions.
+
+    Role mapping: role1 = left arm, role2 = right arm.
+    'grabber' = accepts the handoff, 'picker' = picks up and hands off.
+
+    Returns (left_description, right_description).
     """
     parts = task_name.split(";")
     if len(parts) == 3:
-        role1, role2, obj = parts
+        left_role, right_role, obj = parts
         obj_readable = obj.replace("_", " ")
-        return f"Hand off the {obj_readable} ({role1} to {role2})"
-    return task_name.replace(";", " ").replace("_", " ")
+
+        def _arm_description(role: str, other_side: str) -> str:
+            if role == "grabber":
+                return f"Accept the handoff of the {obj_readable} from the {other_side} arm"
+            elif role == "picker":
+                return f"Pick up the {obj_readable} and hand it to the {other_side} arm"
+            return f"{role} the {obj_readable}"
+
+        left_desc = _arm_description(left_role, "right")
+        right_desc = _arm_description(right_role, "left")
+        return left_desc, right_desc
+
+    fallback = task_name.replace(";", " ").replace("_", " ")
+    return fallback, fallback
 
 
 def generate_augmentation(dataset_root: str | Path) -> list[dict]:
@@ -104,7 +309,12 @@ def generate_augmentation(dataset_root: str | Path) -> list[dict]:
     # Load task name (task name is the DataFrame index, not a column)
     tasks_df = pd.read_parquet(dataset_root / "meta" / "tasks.parquet")
     task_name = str(tasks_df.index[0])
-    task_description = parse_task_description(task_name)
+    left_task_description, right_task_description = parse_task_description(task_name)
+
+    # Determine arm roles from task name (format: "role_left;role_right;object")
+    parts = task_name.split(";")
+    left_role = parts[0] if len(parts) >= 2 else "picker"
+    right_role = parts[1] if len(parts) >= 2 else "grabber"
 
     # Load episode metadata (concatenate all chunk files)
     episode_files = sorted(
@@ -112,6 +322,12 @@ def generate_augmentation(dataset_root: str | Path) -> list[dict]:
     )
     episodes_df = pd.concat(
         [pd.read_parquet(f) for f in episode_files], ignore_index=True
+    )
+
+    # Load data parquet (all chunks) for action data
+    data_files = sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    data_df = pd.concat(
+        [pd.read_parquet(f) for f in data_files], ignore_index=True
     )
 
     # Create output directory
@@ -131,21 +347,54 @@ def generate_augmentation(dataset_root: str | Path) -> list[dict]:
         frame_indices_4fps = compute_4fps_indices(num_frames)
         num_frames_4fps = len(frame_indices_4fps)
 
+        # Extract per-episode action data
+        ep_start = int(row["dataset_from_index"])
+        ep_end = int(row["dataset_to_index"])
+        actions = np.stack(data_df.iloc[ep_start:ep_end]["action"].values)  # (N, 12)
+        left_actions = actions[:, :6]   # joints 0-5
+        right_actions = actions[:, 6:]  # joints 6-11
+
+        # Classify stages jointly (both arms in lockstep)
+        if left_role == "picker":
+            left_stages, right_stages = classify_stages_joint(
+                left_actions, right_actions
+            )
+        else:
+            right_stages, left_stages = classify_stages_joint(
+                right_actions, left_actions
+            )
+
+        # Sample stages at 4 FPS and ensure minimum intermediate frames
+        left_stages_4fps = [left_stages[idx] for idx in frame_indices_4fps]
+        right_stages_4fps = [right_stages[idx] for idx in frame_indices_4fps]
+
+        left_intermediate = "releasing" if left_role == "picker" else "holding"
+        right_intermediate = "holding" if left_role == "picker" else "releasing"
+
+        left_stages_4fps = ensure_min_intermediate_frames(left_stages_4fps, left_intermediate)
+        right_stages_4fps = ensure_min_intermediate_frames(right_stages_4fps, right_intermediate)
+
+        left_cot = [f"<think>{s}</think>" for s in left_stages_4fps]
+        right_cot = [f"<think>{s}</think>" for s in right_stages_4fps]
+
         augmentation = {
             "episode_index": ep_idx,
             "task": task_name,
-            "task_description": task_description,
             "num_frames_30fps": num_frames,
             "num_frames_4fps": num_frames_4fps,
             "left_arm": {
+                "role": left_role,
+                "task_description": left_task_description,
                 "system_prompt": SYSTEM_PROMPT_LEFT,
                 "user_prompt_template": USER_PROMPT_TEMPLATE_LEFT,
-                "chain_of_thought_template": COT_TEMPLATE,
+                "chain_of_thought": left_cot,
             },
             "right_arm": {
+                "role": right_role,
+                "task_description": right_task_description,
                 "system_prompt": SYSTEM_PROMPT_RIGHT,
                 "user_prompt_template": USER_PROMPT_TEMPLATE_RIGHT,
-                "chain_of_thought_template": COT_TEMPLATE,
+                "chain_of_thought": right_cot,
             },
             "frame_indices_4fps": frame_indices_4fps,
         }
@@ -216,13 +465,32 @@ def validate_augmentation(dataset_root: str | Path) -> None:
                 f"Episode {ep_idx}: frame index {idx} out of bounds"
             )
 
-        # Check required keys
+        # Check required keys and per-frame CoT
         for arm in ["left_arm", "right_arm"]:
+            assert "task_description" in aug[arm]
             assert "system_prompt" in aug[arm]
             assert "user_prompt_template" in aug[arm]
-            assert "chain_of_thought_template" in aug[arm]
+            assert "chain_of_thought" in aug[arm]
             assert "{action_history}" in aug[arm]["user_prompt_template"]
             assert "{task_description}" in aug[arm]["user_prompt_template"]
+
+            # Validate per-frame CoT array
+            cot_list = aug[arm]["chain_of_thought"]
+            assert isinstance(cot_list, list), (
+                f"Episode {ep_idx} {arm}: chain_of_thought must be a list"
+            )
+            assert len(cot_list) == aug["num_frames_4fps"], (
+                f"Episode {ep_idx} {arm}: chain_of_thought length "
+                f"{len(cot_list)} != num_frames_4fps {aug['num_frames_4fps']}"
+            )
+            for t, cot in enumerate(cot_list):
+                assert cot.startswith("<think>") and cot.endswith("</think>"), (
+                    f"Episode {ep_idx} {arm} frame {t}: bad CoT format: {cot}"
+                )
+                stage = cot[len("<think>"):-len("</think>")]
+                assert stage in ALL_STAGE_NAMES, (
+                    f"Episode {ep_idx} {arm} frame {t}: unknown stage '{stage}'"
+                )
 
     print(f"  Validated {len(json_files)} augmentation files - all OK")
 

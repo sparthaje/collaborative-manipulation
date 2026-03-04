@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import json
 import math
+import random
+import re
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +29,7 @@ from torch.utils.data import ConcatDataset, Dataset
 
 from lerobot.datasets.video_utils import decode_video_frames
 
-from scripts.augment_episodes import load_ignore_list
+from scripts.augment_episodes import load_ignore_list, ALL_STAGE_NAMES
 from model.tokenizer import ActionTokenizer
 
 
@@ -59,6 +62,7 @@ class SiameseVLADataset(Dataset):
         ignore_episodes: set[int] | None = None,
         video_backend: str = "torchcodec",
         tolerance_s: float = 0.05,
+        balance_seed: int = 42,
     ):
         self.dataset_root = Path(dataset_root)
         self.video_backend = video_backend
@@ -146,6 +150,83 @@ class SiameseVLADataset(Dataset):
             for t in range(num_valid):
                 self._index_table.append((ep_idx, t, "left"))
                 self._index_table.append((ep_idx, t, "right"))
+
+        # --- Intent balancing ---
+        self._apply_intent_balance(balance_seed)
+
+    def _load_balance_config(self) -> dict | None:
+        """Load balance config with per-dataset override > global default fallback."""
+        per_dataset = self.dataset_root / "balance_config.json"
+        global_default = self.dataset_root.parent / "balance_config.json"
+
+        config_path = per_dataset if per_dataset.exists() else global_default
+        if not config_path.exists():
+            return None
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # Validate retention fractions are in [0, 1]
+        for role, intents in config.items():
+            for intent, frac in intents.items():
+                if not 0.0 <= frac <= 1.0:
+                    raise ValueError(
+                        f"Balance config: {role}/{intent} retention={frac}, "
+                        f"expected value in [0, 1]"
+                    )
+        return config
+
+    def _get_intent(self, ep_idx: int, t_4fps: int, arm: str) -> tuple[str, str]:
+        """Return (role, intent) for a given index entry."""
+        aug = self.augmentations[ep_idx]
+        arm_key = f"{arm}_arm"
+        role = aug[arm_key]["role"]
+        cot = aug[arm_key]["chain_of_thought"][t_4fps]
+        match = re.search(r"<think>(.*?)</think>", cot)
+        intent = match.group(1) if match else "unknown"
+        return role, intent
+
+    def _apply_intent_balance(self, seed: int) -> None:
+        """Subsample _index_table using per-intent retention fractions."""
+        config = self._load_balance_config()
+        if config is None:
+            return
+
+        # Group index entries by (role, intent)
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for i, (ep_idx, t_4fps, arm) in enumerate(self._index_table):
+            role, intent = self._get_intent(ep_idx, t_4fps, arm)
+            groups[(role, intent)].append(i)
+
+        rng = random.Random(seed)
+        keep_indices: set[int] = set()
+
+        for role, intent_retentions in config.items():
+            print(f"\n  Intent balance ({role}):")
+            print(f"    {'Intent':<15} {'Original':>8} {'Retention':>9} {'Kept':>8}")
+            print(f"    {'-'*42}")
+
+            for intent, retention in intent_retentions.items():
+                indices = groups.pop((role, intent), [])
+                cap = math.floor(len(indices) * retention)
+                if cap < len(indices):
+                    sampled = rng.sample(indices, cap)
+                else:
+                    sampled = indices
+                keep_indices.update(sampled)
+                print(f"    {intent:<15} {len(indices):>8} {retention:>8.0%} {len(sampled):>8}")
+
+        # Keep any (role, intent) combos not mentioned in config
+        for key, indices in groups.items():
+            keep_indices.update(indices)
+
+        # Rebuild _index_table preserving original order
+        original_len = len(self._index_table)
+        self._index_table = [
+            self._index_table[i] for i in sorted(keep_indices)
+        ]
+        print(f"\n  Balance filter: {original_len} -> {len(self._index_table)} samples "
+              f"({len(self._index_table)/original_len*100:.1f}% retained)")
 
     def _get_video_path(self, episode_row: pd.Series, video_key: str) -> Path:
         """Construct video file path from episode metadata."""
@@ -245,10 +326,10 @@ class SiameseVLADataset(Dataset):
         arm_key = f"{arm}_arm"
         system_prompt = aug[arm_key]["system_prompt"]
         user_prompt = aug[arm_key]["user_prompt_template"].format(
-            task_description=aug["task_description"],
+            task_description=aug[arm_key]["task_description"],
             action_history=action_history_text,
         )
-        cot = aug[arm_key]["chain_of_thought_template"]
+        cot = aug[arm_key]["chain_of_thought"][t_4fps]
 
         # 4. Action chunk (8 future timesteps at 4 FPS)
         chunk_4fps_indices = list(range(t_4fps, t_4fps + ACTION_CHUNK_LEN))
@@ -293,6 +374,7 @@ def build_combined_dataset(
     data_dir: str | Path,
     video_backend: str = "torchcodec",
     tolerance_s: float = 0.05,
+    balance_seed: int = 42,
 ) -> ConcatDataset:
     """Build a ConcatDataset from all datasets under data_dir.
 
@@ -328,6 +410,7 @@ def build_combined_dataset(
             ignore_episodes=ignore_eps,
             video_backend=video_backend,
             tolerance_s=tolerance_s,
+            balance_seed=balance_seed,
         )
         num_eps = len(ds._episode_data)
         total_episodes += num_eps
@@ -358,15 +441,19 @@ def validate_dataset(dataset_root: str | Path) -> None:
     print("Loading dataset...")
     ds = SiameseVLADataset(dataset_root)
 
-    # Check total size = 2 * sum(valid_frames per episode)
+    # Check total size (with or without balancing)
     total_valid = 0
     for ep_idx, ep_data in ds._episode_data.items():
         num_valid = ep_data["num_frames_4fps"] - ACTION_CHUNK_LEN
         total_valid += num_valid
-    expected_len = 2 * total_valid
+    unbalanced_len = 2 * total_valid
     actual_len = len(ds)
-    print(f"Dataset length: {actual_len} (expected: {expected_len})")
-    assert actual_len == expected_len, f"Length mismatch: {actual_len} != {expected_len}"
+    if actual_len == unbalanced_len:
+        print(f"Dataset length: {actual_len} (no balancing applied)")
+    else:
+        print(f"Dataset length: {actual_len} (unbalanced would be {unbalanced_len}, "
+              f"{actual_len/unbalanced_len*100:.1f}% retained)")
+    assert actual_len > 0, "Dataset is empty after balancing"
     print("Length check PASSED")
 
     # Iterate a few samples
@@ -391,12 +478,18 @@ def validate_dataset(dataset_root: str | Path) -> None:
         assert image.shape[0] == 3, f"Expected CHW format, got shape {image.shape}"
         assert image.min() >= 0 and image.max() <= 1, "Image values out of [0,1] range"
 
-        # Check assistant response has action tokens
+        # Check assistant response has action tokens with valid stage CoT
         assistant_text = sample[2]["content"][0]["text"]
         assert "<think>" in assistant_text
         assert "</think>" in assistant_text
+        # Validate stage name inside think tags
+        think_match = re.search(r"<think>(.*?)</think>", assistant_text)
+        assert think_match is not None, f"Sample {i}: no think tags found"
+        stage_name = think_match.group(1)
+        assert stage_name in ALL_STAGE_NAMES, (
+            f"Sample {i}: unknown stage '{stage_name}'"
+        )
         # Count action tokens
-        import re
         action_tokens = re.findall(r"<action_j\d+_b\d+>", assistant_text)
         assert len(action_tokens) == 48, (
             f"Expected 48 action tokens, got {len(action_tokens)}"
@@ -410,6 +503,15 @@ def validate_dataset(dataset_root: str | Path) -> None:
     print("\nAll validation checks PASSED")
 
 
+def _count_intents(ds: SiameseVLADataset) -> dict[tuple[str, str], int]:
+    """Count frames per (role, intent) in a dataset's index table."""
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    for ep_idx, t_4fps, arm in ds._index_table:
+        role, intent = ds._get_intent(ep_idx, t_4fps, arm)
+        counts[(role, intent)] += 1
+    return counts
+
+
 if __name__ == "__main__":
     import sys
 
@@ -418,4 +520,31 @@ if __name__ == "__main__":
         if len(sys.argv) > 1
         else "data/grabber_picker_black_marker_20260228_150311"
     )
-    validate_dataset(dataset_root)
+
+    print(f"=== Loading {dataset_root.name} ===")
+    ds = SiameseVLADataset(dataset_root)
+    counts = _count_intents(ds)
+
+    all_keys = sorted(counts.keys())
+    roles = sorted(set(k[0] for k in all_keys))
+
+    print(f"\n{'='*50}")
+    print(f"  {dataset_root.name}: {len(ds)} samples")
+    print(f"{'='*50}")
+
+    for role in roles:
+        role_keys = [(r, i) for r, i in all_keys if r == role]
+        role_total = sum(counts[k] for k in role_keys)
+
+        print(f"\n  {role.upper()}")
+        print(f"    {'Intent':<15} {'Count':>8} {'%':>8}")
+        print(f"    {'-'*33}")
+
+        for _, intent in role_keys:
+            c = counts[(role, intent)]
+            pct = c / role_total * 100 if role_total else 0
+            print(f"    {intent:<15} {c:>8} {pct:>7.1f}%")
+
+        print(f"    {'Total':<15} {role_total:>8}")
+
+    print(f"{'='*50}")
