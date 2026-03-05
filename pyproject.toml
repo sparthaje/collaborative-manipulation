@@ -9,6 +9,7 @@ dependencies = [
   "bitsandbytes>=0.49.2",
   "diffusers>=0.35.2",
   "feetech-servo-sdk>=1.0.0",
+  "flask>=3.1.3",
   "lerobot @ git+https://github.com/huggingface/lerobot.git",
   "matplotlib>=3.10.8",
   "opencv-python>=4.10.0.84",
