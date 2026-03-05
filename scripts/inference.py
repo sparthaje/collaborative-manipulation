@@ -398,7 +398,7 @@ def evaluate_samples(
             history_text = format_action_history(action_history, action_tokenizer)
             sys_prompt = aug[arm_key]["system_prompt"]
             usr_prompt = aug[arm_key]["user_prompt_template"].format(
-                task_description=aug["task_description"],
+                task_description=aug[arm_key]["task_description"],
                 action_history=history_text,
             )
 
@@ -410,13 +410,14 @@ def evaluate_samples(
                 user_prompt=usr_prompt,
             )
 
-            # Build expected token string from ground truth
+            # Build expected token string from ground truth (with CoT prefix)
+            cot = aug[arm_key]["chain_of_thought"][t_4fps]
             expected_tokens = []
             for t_step in range(gt_chunk.shape[0]):
                 token_ids = action_tokenizer.encode_action(gt_chunk[t_step])
                 token_names = action_tokenizer.token_ids_to_names(token_ids)
                 expected_tokens.extend(token_names)
-            expected_token_str = " ".join(expected_tokens)
+            expected_token_str = f"{cot}{' '.join(expected_tokens)}"
 
             # Save numpy arrays and joint plot
             np.save(sample_dir / f"{arm}_predicted.npy", predicted)
@@ -444,7 +445,7 @@ def evaluate_samples(
             "ep_idx": ep_idx,
             "t_4fps": t_4fps,
             "dataset_name": dataset_name,
-            "task_description": aug["task_description"],
+            "task_description": aug.get("task", "unknown"),
             "arms": arm_results,
         })
 
